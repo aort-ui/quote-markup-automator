@@ -27,7 +27,7 @@ if uploaded_file is not None:
     elif current_os == 'Darwin': 
         calibri_path = "/Library/Fonts/Microsoft/Calibri.ttf"
     
-    markup_factor = 1.20
+    markup_factor = 1.25
     
     for page_num in range(len(doc)):
         page = doc[page_num]

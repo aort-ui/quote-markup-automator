@@ -1,7 +1,7 @@
-import fitz  # PyMuPDF
 import io
 import os
 import platform
+import fitz  # PyMuPDF
 import streamlit as st
 
 # --- Web App UI Setup ---
@@ -24,7 +24,7 @@ if uploaded_file is not None:
   pdf_bytes = uploaded_file.read()
   doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-  # Locate the Calibri font
+  # Locate Calibri font path dynamically per OS
   current_os = platform.system()
   calibri_path = None
   if current_os == "Windows":
@@ -45,127 +45,178 @@ if uploaded_file is not None:
     target_font = "cali" if use_calibri else "helv"
     words = page.get_text("words")
 
-    # 1. Group words by vertical line (y-coordinate baseline)
-    line_dict = {}
+    # --- STEP 1: Dynamically Detect Column Headers (Qty, Price, Ext Price) ---
+    qty_x, price_x, ext_x = None, None, None
     for w in words:
-      # Group words within ~4 points vertically
-      y_key = round(w[1] / 4.0) * 4.0
-      if y_key not in line_dict:
-        line_dict[y_key] = []
-      line_dict[y_key].append(w)
+      text = w[4].strip().lower()
+      xc = (w[0] + w[2]) / 2
+      if text == "qty" and qty_x is None:
+        qty_x = xc
+      elif text == "price" and price_x is None and ext_x is None:
+        price_x = xc
+      elif "ext" in text and ext_x is None:
+        ext_x = xc
+      elif text == "price" and price_x is not None and ext_x is None:
+        ext_x = xc
 
-    # 2. Process each horizontal row on the quote
-    for y_key, line_words in line_dict.items():
-      # Sort words from left to right
-      line_words.sort(key=lambda item: item[0])
+    # Fallback defaults if headers aren't detected on this page
+    if qty_x is None:
+      qty_x = 310.0
+    if price_x is None:
+      price_x = 390.0
+    if ext_x is None:
+      ext_x = 510.0
 
-      qty_word = None
-      price_word = None
-      ext_word = None
-      total_word = None
+    # --- STEP 2: Collect All Price & Qty Candidate Tokens ---
+    candidates = []
+    for w in words:
+      text = w[4].strip()
+      clean = text.replace("$", "").replace(",", "")
+      xc = (w[0] + w[2]) / 2
+      yc = (w[1] + w[3]) / 2
 
-      # Identify columns based on horizontal (x) position on the page
-      for w in line_words:
-        w_text = w[4].strip()
-        x0 = w[0]
+      try:
+        val = float(clean)
+        if 0 < val <= 500000:
+          col_type = None
+          if abs(xc - qty_x) < 45 and "." not in text:
+            col_type = "qty"
+          elif abs(xc - price_x) < 55 and ("." in text or "$" in text):
+            col_type = "price"
+          elif abs(xc - ext_x) < 65 and ("." in text or "$" in text):
+            col_type = "ext"
 
-        # Check for Merchandise / Total line
-        if "Merchandise:" in w_text or "Total:" in w_text:
-          total_word = w
+          if col_type:
+            candidates.append(
+                {"type": col_type, "val": val, "w": w, "xc": xc, "yc": yc}
+            )
+      except ValueError:
+        continue
+
+    # --- STEP 3: Pass 1 - Pair Line Items Within Vertical Windows ---
+    updated_word_ids = set()
+    candidates.sort(key=lambda c: c["yc"])  # Sort vertically
+    used_indices = set()
+    grouped_rows = []
+
+    for i, c in enumerate(candidates):
+      if i in used_indices:
+        continue
+
+      row = {c["type"]: c}
+      used_indices.add(i)
+
+      # Find matching columns within a 22pt vertical window (handles multi-line items)
+      for j, c2 in enumerate(candidates):
+        if j in used_indices:
           continue
+        if abs(c2["yc"] - c["yc"]) <= 22 and c2["type"] not in row:
+          row[c2["type"]] = c2
+          used_indices.add(j)
 
-        clean = w_text.replace("$", "").replace(",", "")
-        try:
-          val = float(clean)
-          if val <= 0 or val > 500000:
-            continue
+      grouped_rows.append(row)
 
-          # Column bounds based on layout x-coordinates:
-          if 300 <= x0 < 370 and qty_word is None:
-            qty_word = (int(val), w)
-          elif 370 <= x0 < 470 and price_word is None and "." in w_text:
-            price_word = (val, w)
-          elif 470 <= x0 < 580 and ext_word is None and "." in w_text:
-            ext_word = (val, w)
-        except ValueError:
-          continue
+    for r in grouped_rows:
+      q_item = r.get("qty")
+      p_item = r.get("price")
+      e_item = r.get("ext")
 
-      # --- LINE ITEM RECALCULATION (Qty * New Unit Price) ---
-      if qty_word and price_word and ext_word:
-        qty = qty_word[0]
-        old_unit_price = price_word[0]
-        unit_w = price_word[1]
-        ext_w = ext_word[1]
+      if p_item:
+        p_val = p_item["val"]
+        p_w = p_item["w"]
 
-        # Calculate new unit price and multiply strictly by quantity
-        new_unit_price = round(old_unit_price / 0.80, 2)
-        new_ext_price = round(qty * new_unit_price, 2)
+        new_unit_price = round(p_val / 0.80, 2)
+        updated_word_ids.add(id(p_w))
 
-        running_total += new_ext_price
+        # Render new unit price
+        w = p_w
+        rect = fitz.Rect(w[0], w[1], w[2], w[3])
+        page.draw_rect(
+            fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2),
+            color=(1, 1, 1),
+            fill=(1, 1, 1),
+        )
+        page.insert_textbox(
+            fitz.Rect(rect.x1 - 100, rect.y1 - 8, rect.x1, rect.y1 + 5),
+            f"${new_unit_price:,.2f}",
+            fontname=target_font,
+            fontsize=6,
+            color=(0, 0, 0),
+            align=fitz.TEXT_ALIGN_RIGHT,
+        )
 
-        # Redraw Unit Price and Ext Price boxes
-        updates = [
-            (unit_w, f"${new_unit_price:,.2f}"),
-            (ext_w, f"${new_ext_price:,.2f}"),
-        ]
+        # Extended price calculation
+        if q_item:
+          q_val = int(q_item["val"])
+          new_ext_price = round(q_val * new_unit_price, 2)
+        elif e_item:
+          new_ext_price = round(e_item["val"] / 0.80, 2)
+        else:
+          new_ext_price = None
 
-        for w, formatted_text in updates:
+        if e_item and new_ext_price:
+          e_w = e_item["w"]
+          updated_word_ids.add(id(e_w))
+          running_total += new_ext_price
+
+          w = e_w
           rect = fitz.Rect(w[0], w[1], w[2], w[3])
-
-          # Whiteout old text
-          whiteout_box = fitz.Rect(
-              rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2
-          )
-          page.draw_rect(whiteout_box, color=(1, 1, 1), fill=(1, 1, 1))
-
-          # Overlay new calculated text
-          write_box = fitz.Rect(
-              rect.x1 - 100, rect.y1 - 8, rect.x1, rect.y1 + 5
+          page.draw_rect(
+              fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2),
+              color=(1, 1, 1),
+              fill=(1, 1, 1),
           )
           page.insert_textbox(
-              write_box,
-              formatted_text,
+              fitz.Rect(rect.x1 - 100, rect.y1 - 8, rect.x1, rect.y1 + 5),
+              f"${new_ext_price:,.2f}",
               fontname=target_font,
               fontsize=6,
               color=(0, 0, 0),
               align=fitz.TEXT_ALIGN_RIGHT,
           )
 
-      # --- TOTAL RECALCULATION ---
-      # Update the grand total to match the sum of recalculated line items
-      elif total_word or any(
-          "Merchandise:" in w[4] or "Total:" in w[4] for w in line_words
-      ):
-        for w in line_words:
-          w_text = w[4].strip()
-          clean = w_text.replace("$", "").replace(",", "")
-          try:
-            val = float(clean)
-            if val > 1000 and w[0] >= 450:
-              final_total = (
-                  running_total if running_total > 0 else round(val / 0.80, 2)
-              )
-              formatted_text = f"${final_total:,.2f}"
+    # --- STEP 4: Pass 2 - Universal Fallback for Unmatched Prices & Totals ---
+    for w in words:
+      if id(w) in updated_word_ids:
+        continue
 
-              rect = fitz.Rect(w[0], w[1], w[2], w[3])
-              whiteout_box = fitz.Rect(
-                  rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2
-              )
-              page.draw_rect(whiteout_box, color=(1, 1, 1), fill=(1, 1, 1))
+      text = w[4].strip()
+      clean = text.replace("$", "").replace(",", "")
 
-              write_box = fitz.Rect(
-                  rect.x1 - 100, rect.y1 - 8, rect.x1, rect.y1 + 5
-              )
-              page.insert_textbox(
-                  write_box,
-                  formatted_text,
-                  fontname=target_font,
-                  fontsize=6,
-                  color=(0, 0, 0),
-                  align=fitz.TEXT_ALIGN_RIGHT,
-              )
-          except ValueError:
+      try:
+        if "." in text or "$" in text:
+          val = float(clean)
+          if val <= 0 or val > 500000:
             continue
+
+          xc = (w[0] + w[2]) / 2
+
+          # If this is the final total box on the bottom right
+          if xc > (ext_x - 60) and val > 1000:
+            new_val = (
+                running_total if running_total > 0 else round(val / 0.80, 2)
+            )
+          else:
+            new_val = round(val / 0.80, 2)
+
+          formatted_text = f"${new_val:,.2f}"
+
+          rect = fitz.Rect(w[0], w[1], w[2], w[3])
+          page.draw_rect(
+              fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2),
+              color=(1, 1, 1),
+              fill=(1, 1, 1),
+          )
+          page.insert_textbox(
+              fitz.Rect(rect.x1 - 100, rect.y1 - 8, rect.x1, rect.y1 + 5),
+              formatted_text,
+              fontname=target_font,
+              fontsize=6,
+              color=(0, 0, 0),
+              align=fitz.TEXT_ALIGN_RIGHT,
+          )
+      except ValueError:
+        continue
 
   # Save the polished PDF to memory
   output_stream = io.BytesIO()
